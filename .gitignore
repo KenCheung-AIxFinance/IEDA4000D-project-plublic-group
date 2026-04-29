@@ -1,0 +1,10 @@
+/tmp
+CLAUDE.md
+project_instruction.md
+__pycache__/
+*.py[cod]
+*$py.class
+.DS_Store
+.venv/
+outputs/
+temp_prompt.txt
