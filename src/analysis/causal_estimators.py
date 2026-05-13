@@ -202,6 +202,36 @@ def run_mediation_analysis(df, treatment, mediator, outcome, confounders):
         'proportion_mediated': acme / (acme + ade) if (acme+ade) != 0 else 0
     }
 
+class TLearnerWrapper:
+    """
+    T-Learner: Train two separate outcome models — one for treated, one for control.
+    CATE(x) = mu1(x) - mu0(x)
+
+    Unlike X/DR-Learners, T-Learner does NOT use a propensity score model.
+    This makes it a useful baseline: if T-Learner agrees with AIPW/DR, the
+    PS weighting isn't driving the result; if it diverges, PS misspecification
+    may be at play.
+    """
+
+    def __init__(self, model_treated=None, model_control=None):
+        self.model_treated = model_treated or GradientBoostingRegressor(
+            n_estimators=100, max_depth=3, random_state=42
+        )
+        self.model_control = model_control or GradientBoostingRegressor(
+            n_estimators=100, max_depth=3, random_state=42
+        )
+
+    def fit(self, Y, T, X):
+        self.model_treated.fit(X[T == 1], Y[T == 1])
+        self.model_control.fit(X[T == 0], Y[T == 0])
+        return self
+
+    def effect(self, X):
+        mu1 = self.model_treated.predict(X)
+        mu0 = self.model_control.predict(X)
+        return mu1 - mu0
+
+
 def simulate_policy_impact(learner, X_df, target_segment_mask, treatment_cost=0.05):
     """
     Simulates the impact of a targeted policy using an EconML learner.
