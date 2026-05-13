@@ -1,100 +1,210 @@
+"""
+Synthetic Data Generation - Main Orchestrator
+
+Multi-method microdata synthesis from NCES aggregate tables.
+Supports 5 methods: heuristic, ipf, copula, bayesian, sri
+"""
+
+import argparse
 import pandas as pd
 import numpy as np
 from pathlib import Path
+import json
+from datetime import datetime
+from typing import Dict, Any, Optional
 
-def synthesize_data(n=10000, seed=42):
-    np.random.seed(seed)
+# Import synthesizers from synthesis package
+import sys
+from pathlib import Path
+project_root = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(project_root))
+
+from src.data.synthesis import METHOD_MAP
+
+
+def synthesize_all_methods(
+    n: int = 10000,
+    seed: int = 42,
+    output_dir: Optional[Path] = None
+) -> Dict[str, Any]:
+    """
+    Run all synthesis methods and save outputs.
+
+    Parameters:
+    - n: Number of synthetic records per method
+    - seed: Random seed for reproducibility
+    - output_dir: Output directory (default: outputs/tables)
+
+    Returns:
+    - metadata: Combined metadata for all methods
+    """
     project_root = Path('.').resolve()
-    df = pd.read_csv(project_root / 'outputs' / 'tables' / 'nces_postsecondary_tidy.csv')
+    if output_dir is None:
+        output_dir = project_root / 'outputs' / 'tables'
 
-    # --- 1. Extract Marginals ---
-    def get_marginal(table_id, section_label, col_group='STEM major', col_label='Total'):
-        mask = (df['table_id'] == str(table_id)) & \
-               (df['section_label'] == section_label) & \
-               (df['column_group'] == col_group) & \
-               (df['column_label'] == col_label)
-        return df[mask][['row_label', 'estimate']].copy()
+    # Ensure output directory exists
+    output_dir.mkdir(parents=True, exist_ok=True)
 
-    # Probability of STEM given Characteristic (Table 1)
-    # Note: Table 1 column 'STEM major' / 'Total' is the percentage of that group in STEM
-    prob_sex = get_marginal(1, 'Sex')
-    prob_ses = get_marginal(1, 'Family socio-economic status')
-    prob_race = get_marginal(1, 'Race/ethnicity1')
+    # Load NCES data
+    nces_path = project_root / 'outputs' / 'tables' / 'nces_postsecondary_tidy.csv'
+    nces_df = pd.read_csv(nces_path)
 
-    # Probability of STEM given Course (Table 10)
-    # Table 10: Row is course, Col is STEM major
-    prob_course = df[(df['table_id'] == '10') &
-                     (df['column_group'] == 'STEM major in 2006') &
-                     (df['column_label'] == 'Total')][['row_label', 'estimate']]
+    print(f"Loaded NCES data: {len(nces_df)} rows")
+    print(f"Output directory: {output_dir}")
 
-    # Probability of Expectations given Course (Table 4)
-    # This captures the "Ambition" confounder
-    prob_exp = df[(df['table_id'] == '4') &
-                  (df['column_group'] == 'Educational expectation in 2006')][['section_label', 'row_label', 'column_label', 'estimate']]
+    # Combined metadata
+    metadata = {
+        'generated_at': datetime.now().isoformat(),
+        'n': n,
+        'seed': seed,
+        'methods': {}
+    }
 
-    # --- 2. Initialize Synthetic Dataset ---
-    data = pd.DataFrame(index=range(n))
+    # Run each method
+    for method_name, synthesizer_class in METHOD_MAP.items():
+        print(f"\n{'='*50}")
+        print(f"Synthesizing with {method_name}")
+        print('='*50)
 
-    # A. Assign Sex (Roughly 50/50 based on NCES norms)
-    data['sex'] = np.random.choice(['Male', 'Female'], size=n, p=[0.49, 0.51])
+        try:
+            # Create synthesizer
+            synthesizer = synthesizer_class(n=n, seed=seed)
 
-    # B. Assign SES (Uniform quartiles)
-    data['ses'] = np.random.choice(['Lowest', 'Second', 'Third', 'Highest'], size=n)
+            # Run synthesis pipeline
+            synthetic_df = synthesizer.run(nces_df)
 
-    # C. Assign Math Treatment (Calculus)
-    # Overall Calculus rate is ~14.6% in Table 10 total row
-    # We add SES bias: Higher SES -> Higher Calculus probability
-    ses_map = {'Lowest': 0.05, 'Second': 0.10, 'Third': 0.15, 'Highest': 0.30}
-    data['calculus'] = data['ses'].apply(lambda s: np.random.random() < ses_map[s]).astype(int)
+            # Validate schema
+            synthesizer.validate_output_schema(synthetic_df)
 
-    # D. Assign Expectations (based on Table 4)
-    # Simplify to binary: High Expectation (Graduate/Professional)
-    # Table 4: Calculus takers -> 66% High Expectation
-    # Algebra II takers -> 31% High Expectation
-    def assign_expectation(is_calc):
-        p = 0.66 if is_calc else 0.31
-        return 1 if np.random.random() < p else 0
-    data['high_expectation'] = data['calculus'].apply(assign_expectation)
+            # Save CSV
+            output_path = output_dir / f'synthetic_students_{method_name}.csv'
+            synthetic_df.to_csv(output_path, index=False)
+            print(f"Saved {len(synthetic_df)} records to {output_path}")
 
-    # NEW: E. Assign Math Enjoyment (based on Table 15)
-    # Viewpoint: Calculus takers are more likely to enjoy math (Selection into Treatment)
-    # Table 15: ~40% of those who "Strongly Agree" math is fun end up in STEM.
-    def assign_enjoyment(is_calc, ses):
-        # Base probability of high enjoyment
-        p = 0.45 if is_calc else 0.20
-        # Add SES boost (cultural capital)
-        if ses == 'Highest': p += 0.1
-        return 1 if np.random.random() < p else 0
-    data['math_enjoyment'] = data.apply(lambda row: assign_enjoyment(row['calculus'], row['ses']), axis=1)
+            # Print summary statistics
+            print(f"\n  Sex:     {synthetic_df['sex'].value_counts().to_dict()}")
+            print(f"  SES:     {synthetic_df['ses'].value_counts().to_dict()}")
+            print(f"  Calculus: {synthetic_df['calculus'].mean()*100:.1f}%")
+            print(f"  STEM:    {synthetic_df['stem_major'].mean()*100:.1f}%")
 
-    # F. Assign STEM Outcome
-    # Map sex effect (Male: ~25%, Female: ~8% from Table 1)
-    sex_p = {'Male': 0.25, 'Female': 0.08}
-    ses_p = {'Highest': 0.22, 'Third': 0.18, 'Second': 0.14, 'Lowest': 0.10}
-    calc_p = {1: 0.40, 0: 0.14}
+            # Add to metadata
+            metadata['methods'][method_name] = synthesizer.metadata
 
-    def get_stem_prob(row):
-        # 1. Base probability from demographics and treatment
-        p = (sex_p[row['sex']] + ses_p[row['ses']] + calc_p[row['calculus']]) / 3
+        except Exception as e:
+            print(f"ERROR in {method_name}: {e}")
+            metadata['methods'][method_name] = {
+                'error': str(e),
+                'status': 'failed'
+            }
 
-        # 2. Add Psychosocial Boosts
-        # Math Enjoyment is a massive predictor (~40% probability in Table 15)
-        if row['math_enjoyment']:
-            p += 0.15  # The "Passion" premium
+    # Save combined metadata
+    metadata_path = output_dir / 'synthesis_metadata.json'
+    with open(metadata_path, 'w') as f:
+        json.dump(metadata, f, indent=2, default=str)
 
-        # Educational Ambition
-        if row['high_expectation']:
-            p += 0.05  # The "Ambition" premium
+    print(f"\n{'='*50}")
+    print(f"Synthesis Complete!")
+    print('='*50)
+    print(f"Metadata saved to: {metadata_path}")
+    print(f"\nGenerated files:")
+    for method_name in METHOD_MAP.keys():
+        csv_path = output_dir / f'synthetic_students_{method_name}.csv'
+        if csv_path.exists():
+            print(f"  - {csv_path.name}")
 
-        return np.clip(p, 0, 1)
+    return metadata
 
-    data['stem_prob'] = data.apply(get_stem_prob, axis=1)
-    data['stem_major'] = (np.random.random(n) < data['stem_prob']).astype(int)
 
-    # Save output
-    output_path = project_root / 'outputs' / 'tables' / 'synthetic_students.csv'
-    data.to_csv(output_path, index=False)
-    print(f"Generated {n} synthetic student records at {output_path}")
+def synthesize_single_method(
+    method: str,
+    n: int = 10000,
+    seed: int = 42,
+    output_dir: Optional[Path] = None
+) -> pd.DataFrame:
+    """
+    Run single synthesis method.
 
-if __name__ == "__main__":
-    synthesize_data()
+    Parameters:
+    - method: Method name ('heuristic', 'ipf', 'copula', 'bayesian', 'sri')
+    - n: Number of synthetic records
+    - seed: Random seed
+    - output_dir: Output directory
+
+    Returns:
+    - synthetic_df: Generated synthetic DataFrame
+    """
+    if method not in METHOD_MAP:
+        raise ValueError(
+            f"Unknown method: {method}. Available: {list(METHOD_MAP.keys())}"
+        )
+
+    project_root = Path('.').resolve()
+    if output_dir is None:
+        output_dir = project_root / 'outputs' / 'tables'
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    # Load NCES data
+    nces_path = project_root / 'outputs' / 'tables' / 'nces_postsecondary_tidy.csv'
+    nces_df = pd.read_csv(nces_path)
+
+    # Create synthesizer
+    synthesizer_class = METHOD_MAP[method]
+    synthesizer = synthesizer_class(n=n, seed=seed)
+
+    # Run synthesis
+    synthetic_df = synthesizer.run(nces_df)
+
+    # Validate and save
+    synthesizer.validate_output_schema(synthetic_df)
+    output_path = output_dir / f'synthetic_students_{method}.csv'
+    synthetic_df.to_csv(output_path, index=False)
+
+    print(f"Generated {len(synthetic_df)} records using {method}")
+    print(f"Saved to: {output_path}")
+
+    return synthetic_df
+
+
+def main():
+    """CLI entry point."""
+    parser = argparse.ArgumentParser(
+        description='Synthetic data generation from NCES tables'
+    )
+    parser.add_argument(
+        '--method',
+        choices=['all', 'heuristic', 'ipf', 'copula', 'bayesian', 'sri'],
+        default='all',
+        help='Synthesis method to run'
+    )
+    parser.add_argument(
+        '--n',
+        type=int,
+        default=10000,
+        help='Number of synthetic records'
+    )
+    parser.add_argument(
+        '--seed',
+        type=int,
+        default=42,
+        help='Random seed'
+    )
+    parser.add_argument(
+        '--output-dir',
+        type=str,
+        default='outputs/tables',
+        help='Output directory'
+    )
+
+    args = parser.parse_args()
+
+    output_dir = Path(args.output_dir)
+
+    if args.method == 'all':
+        synthesize_all_methods(args.n, args.seed, output_dir)
+    else:
+        synthesize_single_method(args.method, args.n, args.seed, output_dir)
+
+
+if __name__ == '__main__':
+    main()
